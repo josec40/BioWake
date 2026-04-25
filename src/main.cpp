@@ -1,21 +1,37 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <SD.h>
 #include <SPI.h>
 #include "config.h"
 #include "telemetry.h"
 
-// --- Global Objects ---
+// =============================================================
+// GLOBAL OBJECTS
+// =============================================================
+
 TelemetryManager telemetry;
 File logFile;
+WebServer server(BRIDGE_PORT);
 
-// --- Timing ---
+// --- AI Classifier Flag (Phase 2: set by Edge Impulse model) ---
+volatile bool rem_transition_detected = false;
+
+// =============================================================
+// TIMING & STATE
+// =============================================================
+
 uint32_t lastSampleTime = 0;
 uint32_t sampleCount = 0;
 bool sdReady = false;
 bool sensorsReady = false;
+bool wifiConnected = false;
 
-// --- Write Buffer ---
-// Buffer multiple lines before writing to SD to reduce I/O overhead
+// =============================================================
+// SD WRITE BUFFER (4KB — reduces SPI I/O from 100/s to ~2.5/s)
+// =============================================================
+
 #define WRITE_BUFFER_SIZE 4096
 char writeBuffer[WRITE_BUFFER_SIZE];
 int bufferPos = 0;
@@ -30,7 +46,6 @@ void flushBuffer() {
 
 void appendToBuffer(const char* line) {
     int len = strlen(line);
-    // If this line would overflow the buffer, flush first
     if (bufferPos + len + 1 >= WRITE_BUFFER_SIZE) {
         flushBuffer();
     }
@@ -39,51 +54,97 @@ void appendToBuffer(const char* line) {
     writeBuffer[bufferPos++] = '\n';
 }
 
+// =============================================================
+// SD CARD INITIALIZATION
+// =============================================================
+
 bool initSD() {
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
     if (!SD.begin(SD_CS)) {
         Serial.println("[FAIL] SD Card Mount Failed!");
         return false;
     }
-    
-    // Print card info
     uint64_t cardSize = SD.cardSize() / (1024 * 1024);
     Serial.printf("[OK]   SD Card: %lluMB\n", cardSize);
     return true;
 }
 
 bool openLogFile() {
-    // Generate unique filename based on boot time
     char filename[32];
     snprintf(filename, sizeof(filename), "/somnus_%lu.csv", millis());
-    
     logFile = SD.open(filename, FILE_WRITE);
     if (!logFile) {
         Serial.printf("[FAIL] Could not create %s\n", filename);
         return false;
     }
-
-    // Write CSV header
     logFile.println(telemetry.getCSVHeader());
     logFile.flush();
     Serial.printf("[OK]   Logging to: %s\n", filename);
     return true;
 }
 
+// =============================================================
+// WIFI STATUS BRIDGE
+// =============================================================
+
+void handleCheckAlarm() {
+    server.send(200, "text/plain", rem_transition_detected ? "1" : "0");
+}
+
+void initWiFiBridge() {
+    Serial.printf("[....] Connecting to WiFi: %s\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    // Non-blocking wait with 10-second timeout
+    unsigned long wifiStart = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart < WIFI_TIMEOUT_MS)) {
+        delay(100); // Short yield — acceptable in setup() only
+        Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        Serial.printf("[OK]   WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+
+        // Start mDNS
+        if (MDNS.begin(MDNS_HOSTNAME)) {
+            Serial.printf("[OK]   mDNS: http://%s.local\n", MDNS_HOSTNAME);
+        } else {
+            Serial.println("[WARN] mDNS failed to start.");
+        }
+
+        // Start WebServer
+        server.on("/check-alarm", handleCheckAlarm);
+        server.begin();
+        Serial.printf("[OK]   Bridge: http://%s.local/check-alarm\n", MDNS_HOSTNAME);
+    } else {
+        wifiConnected = false;
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        Serial.println("[WARN] WiFi connection failed. Proceeding without bridge.");
+        Serial.println("       SD logging will operate normally.");
+    }
+}
+
+// =============================================================
+// SETUP
+// =============================================================
+
 void setup() {
     Serial.begin(115200);
-    
+
     // Wait for USB-CDC serial connection (up to 5 seconds)
     unsigned long waitStart = millis();
     while (!Serial && (millis() - waitStart < 5000)) {
         delay(100);
     }
-    delay(500); // Extra settle time
+    delay(500);
 
     Serial.println();
     Serial.println("========================================");
-    Serial.println("  Project Somnus — SD Logging Mode");
-    Serial.println("  Firmware v0.1 (Test Build)");
+    Serial.println("  Project Somnus — v0.2 (WiFi Bridge)");
     Serial.println("========================================");
     Serial.println();
 
@@ -101,59 +162,73 @@ void setup() {
     Serial.println("[....] Mounting SD card...");
     sdReady = initSD();
     if (!sdReady) {
-        while (true) {
-            Serial.println("[FATAL] SD CARD FAILED — Check wiring: CS=10, MOSI=11, SCK=12, MISO=13");
-            delay(3000);
-        }
+        Serial.println("[WARN] SD card not available. Logging disabled.");
+        Serial.println("       Check: card inserted? FAT32? Wiring: CS=10, MOSI=11, SCK=12, MISO=13");
     }
 
-    // 3. Open Log File
-    if (!openLogFile()) {
-        while (true) {
-            Serial.println("[FATAL] Cannot create log file. Check SD card is FAT32.");
-            delay(3000);
-        }
+    // 3. Initialize WiFi Bridge (10s timeout — never blocks logging)
+    initWiFiBridge();
+
+    // 4. Open Log File (only if SD is ready)
+    if (sdReady && !openLogFile()) {
+        sdReady = false;
+        Serial.println("[WARN] Could not create log file. Logging disabled.");
     }
 
     Serial.println();
     Serial.printf("Sampling at %dHz. Logging started.\n", SAMPLING_RATE_HZ);
-    Serial.println("Pull power to stop. Data is flushed every ~500 samples (5s).");
+    if (wifiConnected) {
+        Serial.printf("Bridge active at http://%s.local/check-alarm\n", MDNS_HOSTNAME);
+    }
     Serial.println("========================================");
     Serial.println();
 
     lastSampleTime = micros();
 }
 
+// =============================================================
+// MAIN LOOP
+// =============================================================
+
 void loop() {
     uint32_t now = micros();
 
-    // Precise 100Hz sampling (10,000 µs interval)
+    // ── PRIORITY 1: 100Hz Sensor Sampling + SD Logging ──
     if (now - lastSampleTime >= SAMPLING_PERIOD_US) {
         lastSampleTime += SAMPLING_PERIOD_US; // Additive for drift correction
 
-        // Read all sensors
         TelemetryData data = telemetry.readSensors();
 
-        // Format into CSV line using stack buffer (no heap allocation)
-        char csvLine[128];
-        telemetry.toCSV(data, csvLine, sizeof(csvLine));
-
-        // Append to write buffer
-        appendToBuffer(csvLine);
+        // Log to SD if available
+        if (sdReady) {
+            char csvLine[128];
+            telemetry.toCSV(data, csvLine, sizeof(csvLine));
+            appendToBuffer(csvLine);
+        }
 
         sampleCount++;
 
-        // Flush buffer to SD every 500 samples (5 seconds at 100Hz)
-        if (sampleCount % 500 == 0) {
+        // Flush to SD every 500 samples (5 seconds)
+        if (sdReady && sampleCount % 500 == 0) {
             flushBuffer();
         }
 
-        // Periodic status report every 10 seconds
+        // Status report every 10 seconds
         if (sampleCount % 1000 == 0) {
             uint32_t runtimeSec = millis() / 1000;
-            Serial.printf("[%02lu:%02lu:%02lu] Samples: %lu | Heap: %u bytes | Min Heap: %u bytes\n",
+            Serial.printf("[%02lu:%02lu:%02lu] Samples: %lu | Heap: %u | MinHeap: %u | WiFi: %s\n",
                           runtimeSec / 3600, (runtimeSec % 3600) / 60, runtimeSec % 60,
-                          sampleCount, ESP.getFreeHeap(), ESP.getMinFreeHeap());
+                          sampleCount, ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+                          wifiConnected ? "ON" : "OFF");
         }
+    }
+
+    // ── PRIORITY 2: Service WiFi Bridge (idle time between samples) ──
+    if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+        server.handleClient();
+    } else if (wifiConnected && WiFi.status() != WL_CONNECTED) {
+        // WiFi dropped — update flag, don't attempt reconnect mid-sleep
+        wifiConnected = false;
+        Serial.println("[WARN] WiFi connection lost. Bridge disabled.");
     }
 }
