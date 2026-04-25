@@ -1,0 +1,24 @@
+# PlatformIO Configuration
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+
+# Build artifacts
+*.o
+*.elf
+*.bin
+*.a
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Test data / Logs
+*.csv
+somnus_*.csv
