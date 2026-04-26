@@ -29,29 +29,69 @@ bool sensorsReady = false;
 bool wifiConnected = false;
 
 // =============================================================
-// SD WRITE BUFFER (4KB — reduces SPI I/O from 100/s to ~2.5/s)
+// PSRAM CIRCULAR QUEUE (Core 1 Writer -> Core 0 Reader)
 // =============================================================
 
-#define WRITE_BUFFER_SIZE 4096
-char writeBuffer[WRITE_BUFFER_SIZE];
-int bufferPos = 0;
+#define QUEUE_CAPACITY 4000 // ~112KB statically mapped in PSRAM
+TelemetryData* dataQueue = nullptr;
 
-void flushBuffer() {
-    if (bufferPos > 0 && logFile) {
-        logFile.write((uint8_t*)writeBuffer, bufferPos);
-        logFile.flush();
-        bufferPos = 0;
+volatile uint32_t queueHead = 0; // Written solely by Core 1 (100Hz Loop)
+volatile uint32_t queueTail = 0; // Read solely by Core 0 (SD Writer Task)
+
+TaskHandle_t sdWriterTaskHandle;
+
+// =============================================================
+// FREE-RTOS SD WRITER TASK (CORE 0)
+// =============================================================
+
+void sdWriterTask(void *pvParameters) {
+    char csvLine[128];
+    uint32_t flushCounter = 0;
+    
+    while (true) {
+        // If there's new data waiting and SD is mounted
+        if (sdReady && queueTail != queueHead) {
+            // 1. Fetch struct from PSRAM
+            TelemetryData data = dataQueue[queueTail];
+            
+            // 2. Format on Core 0 (keeping CPU cost away from Core 1)
+            telemetry.toCSV(data, csvLine, sizeof(csvLine));
+            
+            // 3. Write directly to log file
+            logFile.println(csvLine);
+            
+            // 4. Advance tail
+            queueTail = (queueTail + 1) % QUEUE_CAPACITY;
+            flushCounter++;
+            
+            // 5. Force a physical SD flush every 500 samples (5 seconds)
+            if (flushCounter % 500 == 0) {
+                logFile.flush();
+            }
+        } else {
+            // Task yields nicely allowing WiFi to operate on Core 0 natively
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 }
 
-void appendToBuffer(const char* line) {
-    int len = strlen(line);
-    if (bufferPos + len + 1 >= WRITE_BUFFER_SIZE) {
-        flushBuffer();
-    }
-    memcpy(writeBuffer + bufferPos, line, len);
-    bufferPos += len;
-    writeBuffer[bufferPos++] = '\n';
+// =============================================================
+// BOILERPLATE MEMORY CHECKER
+// =============================================================
+
+void checkMemory() {
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t freePSRAM = ESP.getFreePsram();
+    uint32_t minHeap = ESP.getMinFreeHeap();
+    
+    uint32_t runtimeSec = millis() / 1000;
+    Serial.printf("[%02lu:%02lu:%02lu] Samples: %lu | Queue: %u/%u | Free Heap: %u B | Min Heap: %u B | Free PSRAM: %u B | WiFi: %s\n",
+                  runtimeSec / 3600, (runtimeSec % 3600) / 60, runtimeSec % 60,
+                  sampleCount, 
+                  (queueHead >= queueTail) ? (queueHead - queueTail) : (QUEUE_CAPACITY - queueTail + queueHead),
+                  QUEUE_CAPACITY,
+                  freeHeap, minHeap, freePSRAM,
+                  wifiConnected ? "ON" : "OFF");
 }
 
 // =============================================================
@@ -99,7 +139,7 @@ void initWiFiBridge() {
     // Non-blocking wait with 10-second timeout
     unsigned long wifiStart = millis();
     while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart < WIFI_TIMEOUT_MS)) {
-        delay(100); // Short yield — acceptable in setup() only
+        delay(100); 
         Serial.print(".");
     }
     Serial.println();
@@ -108,14 +148,12 @@ void initWiFiBridge() {
         wifiConnected = true;
         Serial.printf("[OK]   WiFi connected: %s\n", WiFi.localIP().toString().c_str());
 
-        // Start mDNS
         if (MDNS.begin(MDNS_HOSTNAME)) {
             Serial.printf("[OK]   mDNS: http://%s.local\n", MDNS_HOSTNAME);
         } else {
             Serial.println("[WARN] mDNS failed to start.");
         }
 
-        // Start WebServer
         server.on("/check-alarm", handleCheckAlarm);
         server.begin();
         Serial.printf("[OK]   Bridge: http://%s.local/check-alarm\n", MDNS_HOSTNAME);
@@ -135,7 +173,7 @@ void initWiFiBridge() {
 void setup() {
     Serial.begin(115200);
 
-    // Wait for USB-CDC serial connection (up to 5 seconds)
+    // Wait for USB-CDC
     unsigned long waitStart = millis();
     while (!Serial && (millis() - waitStart < 5000)) {
         delay(100);
@@ -144,13 +182,33 @@ void setup() {
 
     Serial.println();
     Serial.println("========================================");
-    Serial.println("  Project Somnus — v0.2 (WiFi Bridge)");
+    Serial.println("  Project Somnus — PSRAM / RTOS Config");
     Serial.println("========================================");
+    Serial.printf("[INFO] Expected Flash: 16777216 bytes (16MB)\n");
+    Serial.printf("[INFO] Actual Flash:   %u bytes\n", ESP.getFlashChipSize());
     Serial.println();
+
+    // 0. Initialize PSRAM (Critical First Step)
+    Serial.println("[....] Initializing PSRAM...");
+    if (psramInit()) {
+        Serial.printf("[OK]   PSRAM Online: %u bytes\n", ESP.getPsramSize());
+    } else {
+        Serial.println("[FATAL] PSRAM initialization failed. Check board settings.");
+        while(true) delay(1000);
+    }
+
+    // Allocate Circular Buffer
+    size_t allocSize = QUEUE_CAPACITY * sizeof(TelemetryData);
+    dataQueue = (TelemetryData *)heap_caps_malloc(allocSize, MALLOC_CAP_SPIRAM);
+    if (!dataQueue) {
+        Serial.printf("[FATAL] Could not allocate %u bytes in PSRAM.\n", allocSize);
+        while(true) delay(1000);
+    }
+    Serial.printf("[OK]   Allocated %u B in PSRAM for Circular Buffer.\n", allocSize);
 
     // 1. Initialize Sensors
     Serial.println("[....] Initializing sensors...");
-    delay(500); // Give I2C peripherals time to power up
+    delay(500);
     sensorsReady = telemetry.begin();
     if (sensorsReady) {
         Serial.println("[OK]   All sensors online.");
@@ -163,23 +221,31 @@ void setup() {
     sdReady = initSD();
     if (!sdReady) {
         Serial.println("[WARN] SD card not available. Logging disabled.");
-        Serial.println("       Check: card inserted? FAT32? Wiring: CS=10, MOSI=11, SCK=12, MISO=13");
     }
 
-    // 3. Initialize WiFi Bridge (10s timeout — never blocks logging)
+    // 3. Initialize WiFi Bridge
     initWiFiBridge();
 
-    // 4. Open Log File (only if SD is ready)
+    // 4. Open Log File
     if (sdReady && !openLogFile()) {
         sdReady = false;
         Serial.println("[WARN] Could not create log file. Logging disabled.");
     }
 
+    // 5. Spin up SD Writer Task on Core 0
+    Serial.println("[....] Spawning RTOS Writer Task on Core 0...");
+    xTaskCreatePinnedToCore(
+        sdWriterTask,
+        "SDWriter",
+        8192,
+        NULL,
+        1,
+        &sdWriterTaskHandle,
+        0
+    );
+
     Serial.println();
-    Serial.printf("Sampling at %dHz. Logging started.\n", SAMPLING_RATE_HZ);
-    if (wifiConnected) {
-        Serial.printf("Bridge active at http://%s.local/check-alarm\n", MDNS_HOSTNAME);
-    }
+    Serial.printf("Sampling at %dHz strictly tied to Core 1. Logging started.\n", SAMPLING_RATE_HZ);
     Serial.println("========================================");
     Serial.println();
 
@@ -187,47 +253,38 @@ void setup() {
 }
 
 // =============================================================
-// MAIN LOOP
+// MAIN LOOP (CORE 1: Dedicated solely to 100Hz hardware reads)
 // =============================================================
 
 void loop() {
     uint32_t now = micros();
 
-    // ── PRIORITY 1: 100Hz Sensor Sampling + SD Logging ──
+    // ── PRIORITY 1: Precise 100Hz Sensor Polling ──
     if (now - lastSampleTime >= SAMPLING_PERIOD_US) {
-        lastSampleTime += SAMPLING_PERIOD_US; // Additive for drift correction
+        lastSampleTime += SAMPLING_PERIOD_US; 
 
+        // Read hardware
         TelemetryData data = telemetry.readSensors();
 
-        // Log to SD if available
-        if (sdReady) {
-            char csvLine[128];
-            telemetry.toCSV(data, csvLine, sizeof(csvLine));
-            appendToBuffer(csvLine);
+        // Push instantly to PSRAM ring buffer
+        uint32_t nextHead = (queueHead + 1) % QUEUE_CAPACITY;
+        if (nextHead != queueTail) { // Proceed only if queue isn't full
+            dataQueue[queueHead] = data;
+            queueHead = nextHead;
         }
 
         sampleCount++;
 
-        // Flush to SD every 500 samples (5 seconds)
-        if (sdReady && sampleCount % 500 == 0) {
-            flushBuffer();
-        }
-
         // Status report every 10 seconds
         if (sampleCount % 1000 == 0) {
-            uint32_t runtimeSec = millis() / 1000;
-            Serial.printf("[%02lu:%02lu:%02lu] Samples: %lu | Heap: %u | MinHeap: %u | WiFi: %s\n",
-                          runtimeSec / 3600, (runtimeSec % 3600) / 60, runtimeSec % 60,
-                          sampleCount, ESP.getFreeHeap(), ESP.getMinFreeHeap(),
-                          wifiConnected ? "ON" : "OFF");
+            checkMemory();
         }
     }
 
-    // ── PRIORITY 2: Service WiFi Bridge (idle time between samples) ──
+    // ── PRIORITY 2: Service WiFi Bridge ──
     if (wifiConnected && WiFi.status() == WL_CONNECTED) {
         server.handleClient();
     } else if (wifiConnected && WiFi.status() != WL_CONNECTED) {
-        // WiFi dropped — update flag, don't attempt reconnect mid-sleep
         wifiConnected = false;
         Serial.println("[WARN] WiFi connection lost. Bridge disabled.");
     }
