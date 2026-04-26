@@ -44,6 +44,21 @@
 #define WAKE_WINDOW_DUR_MINS 30   // Window ends at 7:00 AM
 
 // =============================================================
+// NIGHTMARE / PTSD INTERVENTION CONFIG
+// =============================================================
+
+// GSR Spike Detection — Moving Baseline
+#define GSR_BASELINE_WINDOW    64     // Samples in EMA window (~5s at 12.5Hz downsample rate)
+#define GSR_SPIKE_MULTIPLIER   1.5f   // Current GSR must exceed baseline × this to count as a spike
+#define GSR_SPIKE_ABS_MIN      200    // Minimum absolute GSR value to even consider a spike (ignore noise floor)
+
+// Cooldown — prevents spamming the connected device
+#define NIGHTMARE_COOLDOWN_MS  300000  // 5 minutes (300,000 ms)
+
+// BLE Command dispatched when a nightmare intervention triggers
+#define NIGHTMARE_BLE_CMD      99      // Integer code sent via BLE characteristic / media key
+
+// =============================================================
 // TELEMETRY DATA STRUCTURE
 // =============================================================
 

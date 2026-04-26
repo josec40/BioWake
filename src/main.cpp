@@ -62,6 +62,16 @@ String latestPredictionLabel = "Gathering Buffer...";
 float latestPredictionScore = 0.0f;
 int downsampleTick = 0;
 
+// =============================================================
+// NIGHTMARE / PTSD INTERVENTION STATE
+// =============================================================
+
+float gsrBaseline = 0.0f;            // Exponential Moving Average of GSR
+bool gsrBaselineSeeded = false;       // First-sample flag for EMA init
+float latestGsrRaw = 0.0f;           // Most recent downsampled GSR value (shared with inference task)
+unsigned long lastNightmareFireMs = 0; // millis() timestamp of last intervention trigger
+bool nightmareActiveFlag = false;     // True while in active cooldown period
+
 int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
     memcpy(out_ptr, ai_inference_buffer + offset, length * sizeof(float));
     return 0;
@@ -160,6 +170,50 @@ void inferenceTask(void *pvParameters) {
                     }
                 }
             }
+
+            // ---- FEATURE 1: NIGHTMARE / PTSD INTERVENTION ----
+            // Trigger condition: REM sleep + GSR spike above moving baseline
+            // This runs every inference cycle (~2s) independent of the wake window.
+            {
+                unsigned long nowMs = millis();
+
+                // Clear the active flag once cooldown expires
+                if (nightmareActiveFlag && (nowMs - lastNightmareFireMs >= NIGHTMARE_COOLDOWN_MS)) {
+                    nightmareActiveFlag = false;
+                    Serial.println("[NIGHTMARE] Cooldown expired. Monitoring resumed.");
+                }
+
+                // Only evaluate if we are NOT in cooldown
+                if (!nightmareActiveFlag) {
+                    bool isREM = (winLabel == "REM" && winScore >= 0.60f);
+                    bool gsrSpiked = (latestGsrRaw > GSR_SPIKE_ABS_MIN) &&
+                                    (latestGsrRaw > gsrBaseline * GSR_SPIKE_MULTIPLIER);
+
+                    if (isREM && gsrSpiked) {
+                        nightmareActiveFlag = true;
+                        lastNightmareFireMs = nowMs;
+
+                        Serial.println("\n##############################################");
+                        Serial.println(" [NIGHTMARE] INTERVENTION TRIGGERED!");
+                        Serial.printf ("   REM confidence : %.0f%%\n", winScore * 100.0f);
+                        Serial.printf ("   GSR current    : %.0f\n", latestGsrRaw);
+                        Serial.printf ("   GSR baseline   : %.0f\n", gsrBaseline);
+                        Serial.printf ("   Spike ratio    : %.2fx\n", latestGsrRaw / gsrBaseline);
+                        Serial.println("   Action         : PLAY_RELAXING_AUDIO (BLE)");
+
+                        if (bleKeyboard.isConnected()) {
+                            // Send media PLAY to start the relaxing audio on the phone
+                            bleKeyboard.write(KEY_MEDIA_PLAY_PAUSE);
+                            Serial.println("   BLE Status     : Sent PLAY/PAUSE to iPhone");
+                        } else {
+                            Serial.println("   BLE Status     : iPhone NOT connected!");
+                        }
+
+                        Serial.printf ("   Cooldown       : %d min\n", NIGHTMARE_COOLDOWN_MS / 60000);
+                        Serial.println("##############################################\n");
+                    }
+                }
+            }
         }
     }
 }
@@ -180,13 +234,24 @@ void checkMemory() {
     
     String bleState = bleKeyboard.isConnected() ? "[iPhone Paired]" : "[BT Scanning...]";
     
+    // Nightmare intervention status string
+    String nightmareState;
+    if (nightmareActiveFlag) {
+        unsigned long remaining = NIGHTMARE_COOLDOWN_MS - (millis() - lastNightmareFireMs);
+        nightmareState = "COOLDOWN(" + String(remaining / 1000) + "s)";
+    } else {
+        nightmareState = "MONITORING";
+    }
+
     // Detailed output strictly formatted
-    Serial.printf("%s %s | SD_Queue: %04u | PSRAM: %u | AI Pred: %s (%.0f%%) | Alarm: %s\n",
+    Serial.printf("%s %s | SD_Q: %04u | PSRAM: %u | AI: %s (%.0f%%) | Alarm: %s | GSR: %.0f/%.0f | Nightmare: %s\n",
                   timeString, bleState.c_str(),
                   (queueHead >= queueTail) ? (queueHead - queueTail) : (QUEUE_CAPACITY - queueTail + queueHead),
                   freePSRAM,
                   latestPredictionLabel.c_str(), latestPredictionScore * 100.0f,
-                  alarm_fired_today ? "FIRED" : "ARMED");
+                  alarm_fired_today ? "FIRED" : "ARMED",
+                  latestGsrRaw, gsrBaseline,
+                  nightmareState.c_str());
 }
 
 // =============================================================
@@ -348,6 +413,18 @@ void loop() {
         downsampleTick++;
         if (downsampleTick >= 8) {
             downsampleTick = 0;
+            
+            // ── GSR Baseline EMA (updated at 12.5 Hz) ──
+            float currentGsr = (float)data.gsr;
+            if (!gsrBaselineSeeded) {
+                gsrBaseline = currentGsr;
+                gsrBaselineSeeded = true;
+            } else {
+                // Exponential Moving Average: α = 1/GSR_BASELINE_WINDOW
+                float alpha = 1.0f / (float)GSR_BASELINE_WINDOW;
+                gsrBaseline = (alpha * currentGsr) + ((1.0f - alpha) * gsrBaseline);
+            }
+            latestGsrRaw = currentGsr;  // Snapshot for inference task
             
             if (xSemaphoreTake(aiMutex, 0)) {
                 memmove(ai_features, ai_features + NUM_AXES, (FEATURE_COUNT - NUM_AXES) * sizeof(float));
