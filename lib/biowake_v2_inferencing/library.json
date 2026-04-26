@@ -1,0 +1,17 @@
+{
+  "name": "biowake_v2_inferencing",
+  "version": "1.0.0",
+  "build": {
+    "flags": [
+      "-I src",
+      "-I src/model-parameters",
+      "-I src/tflite-model"
+    ],
+    "srcFilter": [
+      "+<*>",
+      "-<src/edge-impulse-sdk/porting/>",
+      "+<src/edge-impulse-sdk/porting/espressif/>",
+      "+<src/edge-impulse-sdk/porting/ei_classifier_porting.cpp>"
+    ]
+  }
+}

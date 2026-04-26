@@ -20,9 +20,7 @@
 #define SD_MISO 13
 #define SD_SCK 12
 
-// Interrupt Pins
-#define MAX_INT 14
-#define MPU_INT 15
+// No hardware interrupts used; strictly polling.
 
 // =============================================================
 // SAMPLING CONFIGURATION
@@ -32,14 +30,18 @@
 #define SAMPLING_PERIOD_US (1000000 / SAMPLING_RATE_HZ)
 
 // =============================================================
-// WIFI STATUS BRIDGE
+// ALARM / WAKE WINDOW CONFIG
 // =============================================================
 
 #define WIFI_SSID "ProjectSomnus"
 #define WIFI_PASS "Pass1234"
-#define WIFI_TIMEOUT_MS 10000  // 10-second connection timeout
-#define MDNS_HOSTNAME "somnus" // Discoverable as somnus.local
-#define BRIDGE_PORT 80
+#define WIFI_TIMEOUT_MS 10000     // 10s wait for NTP sync
+#define UTC_OFFSET_SEC -14400     // EDT is UTC-4
+#define NTP_SERVER "pool.ntp.org"
+
+#define WAKE_WINDOW_START_HR 6    // 6:00 AM (24-hour format)
+#define WAKE_WINDOW_START_MIN 30  // 6:30 AM
+#define WAKE_WINDOW_DUR_MINS 30   // Window ends at 7:00 AM
 
 // =============================================================
 // TELEMETRY DATA STRUCTURE

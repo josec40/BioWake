@@ -16,7 +16,7 @@ bool TelemetryManager::begin() {
     byte ledBrightness = 60;
     byte sampleAverage = 4;
     byte ledMode = 2; // Red + IR
-    int sampleRate = 100;
+    int sampleRate = 400; // 400Hz / 4 (Average) = 100Hz Native Output
     int pulseWidth = 411;
     int adcRange = 4096;
     ppg.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth,
