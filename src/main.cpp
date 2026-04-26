@@ -7,6 +7,7 @@
 #include <BleKeyboard.h>
 #include "config.h"
 #include "telemetry.h"
+#include "ble_sleep_service.h"
 
 // =============================================================
 // EDGE IMPULSE AI INFERENCE
@@ -133,6 +134,11 @@ void inferenceTask(void *pvParameters) {
             }
             latestPredictionLabel = winLabel;
             latestPredictionScore = winScore;
+            
+            // ---- FEATURE 2: BLE SLEEP STAGE BROADCAST ----
+            // Update the smart-home BLE characteristic every inference cycle.
+            // Notifications are pushed automatically on Deep_Sleep transitions.
+            updateSleepStage(labelToStageCode(winLabel));
             
             // ---- PHASE 3 WAKE WINDOW CLOSED LOOP ----
             struct tm timeinfo;
@@ -362,6 +368,10 @@ void setup() {
     // Start BLE Keyboard Protocol
     Serial.println("[....] Starting BLE Headphone Service...");
     bleKeyboard.begin();
+
+    // Register custom Sleep Stage GATT service on the same NimBLE server
+    Serial.println("[....] Registering BLE Sleep Stage Service...");
+    initSleepStageService();
 
     Serial.println("[....] Initializing sensors...");
     delay(500);
